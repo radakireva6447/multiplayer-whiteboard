@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Chalkboard – shared whiteboard</title>
+<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<style>
+:root{
+  --bg:#ece8df; --bar:#fbfaf6; --ink:#1d2b2a; --muted:#6b7775; --line:#d6d1c4; --accent:#1f6f66; --accent-ink:#fff;
+}
+@media (prefers-color-scheme: dark){
+  :root{ --bg:#141a19; --bar:#1d2524; --ink:#e8efed; --muted:#93a29f; --line:#2f3b39; --accent:#4fb3a6; --accent-ink:#0c1514; }
+}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{
+  background:var(--bg); color:var(--ink);
+  font:15px/1.4 "Avenir Next","Segoe UI",system-ui,sans-serif;
+  display:flex; flex-direction:column;
+  padding:env(safe-area-inset-top,0) env(safe-area-inset-right,0) env(safe-area-inset-bottom,0) env(safe-area-inset-left,0);
+}
+button{font:inherit;color:inherit;cursor:pointer}
+button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+
+/* Start screen */
+#start{margin:auto;max-width:420px;padding:24px;text-align:left}
+#start h1{font:600 2.4rem/1.1 Georgia,"Iowan Old Style",serif;margin:0 0 12px;letter-spacing:-.01em}
+#start p{color:var(--muted);margin:0 0 24px}
+.row{display:flex;gap:8px;flex-wrap:wrap}
+.btn{border:1px solid var(--line);background:var(--bar);padding:9px 14px;border-radius:8px}
+.btn.primary{background:var(--accent);color:var(--accent-ink);border-color:transparent;font-weight:600}
+#joinForm{display:flex;gap:8px;margin-top:12px}
+#joinForm input{flex:1;min-width:0;padding:9px 12px;border-radius:8px;border:1px solid var(--line);background:var(--bar);color:var(--ink);font:inherit}
+#msg{margin-top:16px;color:var(--muted);min-height:1.4em}
+
+/* Board */
+#app{display:none;flex:1;min-height:0;flex-direction:column}
+#bar{
+  display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+  padding:8px 12px;background:var(--bar);border-bottom:1px solid var(--line);
+}
+.sw{width:28px;height:28px;border-radius:50%;border:2px solid var(--bar);box-shadow:0 0 0 1px var(--line);padding:0}
+.sw[aria-pressed="true"]{box-shadow:0 0 0 2px var(--ink)}
+#custom{width:32px;height:32px;padding:0;border:none;background:none;cursor:pointer}
+#size{width:90px;accent-color:var(--accent)}
+.btn.on{background:var(--ink);color:var(--bar)}
+.btn:disabled{opacity:.45;cursor:default}
+.spacer{flex:1}
+#status{color:var(--muted);font-size:.9rem}
+#stage{flex:1;min-height:0;display:grid;place-items:center;padding:12px}
+#cv{
+  width:min(100%, calc((100dvh - 130px) * 16 / 9));
+  aspect-ratio:16/9;background:#fff;border-radius:6px;
+  box-shadow:0 1px 2px rgba(0,0,0,.15),0 8px 24px rgba(0,0,0,.12);
+  touch-action:none;cursor:crosshair;
+}
+</style>
+</head>
+<body>
+
+<section id="start">
+  <h1>Chalkboard</h1>
+  <p>Start a board on this device, then share the link. Everyone who opens it can draw.</p>
+  <div class="row"><button class="btn primary" id="hostBtn">Host a board</button></div>
+  <form id="joinForm">
+    <input id="code" placeholder="Room code" autocomplete="off" aria-label="Room code">
+    <button class="btn" type="submit">Join</button>
+  </form>
+  <div id="msg" role="status"></div>
+</section>
+
+<section id="app">
+  <div id="bar">
+    <span id="swatches" class="row"></span>
+    <input type="color" id="custom" value="#e03131" aria-label="Custom colour">
+    <input type="range" id="size" min="2" max="40" value="6" aria-label="Brush size">
+    <button class="btn" id="eraser" aria-pressed="false">Eraser</button>
+    <button class="btn" id="undo" disabled>Undo</button>
+    <span class="spacer"></span>
+    <span id="status"></span>
+    <button class="btn" id="save">Save PNG</button>
+    <button class="btn" id="share" hidden>Copy invite link</button>
+    <button class="btn" id="clear" hidden>Clear board</button>
+  </div>
+  <div id="stage"><canvas id="cv" width="1600" height="900"></canvas></div>
+</section>
+
+<script>
+const W = 1600, H = 900;
+const $ = id => document.getElementById(id);
+const cv = $('cv'), ctx = cv.getContext('2d');
+const PREFIX = 'chalkboard-';
+const PALETTE = ['#1d2b2a','#e03131','#f08c00','#f2c200','#2f9e44','#1971c2','#7048e8','#d6336c'];
+
+let color = PALETTE[1], size = 6, erasing = false;
+let peer = null, isHost = false, hostConn = null, guests = [], history = [], roomCode = '';
+let myStrokes = [], curK = null;   // ids of my own strokes, for undo
+
+/* ---------- drawing ---------- */
+function resetCanvas(){
+  ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, W, H);
+  ctx.lineCap = ctx.lineJoin = 'round';
+}
+function drawSeg(s){
+  ctx.strokeStyle = s.c; ctx.lineWidth = s.w;
+  ctx.beginPath(); ctx.moveTo(s.x0, s.y0); ctx.lineTo(s.x1, s.y1); ctx.stroke();
+}
+function emit(s){            // local stroke → draw, record, send
+  drawSeg(s); history.push(s);
+  if (isHost) broadcast(s);
+  else if (hostConn && hostConn.open) hostConn.send(s);
+}
+function redraw(){ resetCanvas(); history.forEach(drawSeg); }
+function applyUndo(k){ history = history.filter(s => s.k !== k); redraw(); }
+function undo(){
+  const k = myStrokes.pop();
+  if (!k) return;
+  applyUndo(k); updateUndo();
+  const msg = { t:'undo', k };
+  if (isHost) broadcast(msg);
+  else if (hostConn && hostConn.open) hostConn.send(msg);
+}
+function updateUndo(){ $('undo').disabled = myStrokes.length === 0; }
+function broadcast(msg, except){
+  guests.forEach(c => { if (c !== except && c.open) c.send(msg); });
+}
+
+let last = null;
+function pt(e){
+  const r = cv.getBoundingClientRect();
+  return { x: (e.clientX - r.left) * W / r.width, y: (e.clientY - r.top) * H / r.height };
+}
+function seg(a, b){
+  return { t:'s', c: erasing ? '#fff' : color, w: erasing ? size * 3 : size, x0:a.x, y0:a.y, x1:b.x, y1:b.y, k:curK };
+}
+cv.addEventListener('pointerdown', e => {
+  cv.setPointerCapture(e.pointerId);
+  curK = Math.random().toString(36).slice(2, 10);
+  myStrokes.push(curK); updateUndo();
+  last = pt(e); emit(seg(last, last));
+});
+cv.addEventListener('pointermove', e => {
+  if (!last) return;
+  const p = pt(e); emit(seg(last, p)); last = p;
+});
+['pointerup','pointercancel'].forEach(n => cv.addEventListener(n, () => { last = null; curK = null; }));
+
+/* ---------- networking ---------- */
+function say(t){ $('msg').textContent = t; }
+function showBoard(){
+  $('start').style.display = 'none';
+  $('app').style.display = 'flex';
+  $('share').hidden = $('clear').hidden = !isHost;
+}
+function updateStatus(){
+  $('status').textContent = isHost
+    ? `Room ${roomCode} · ${guests.length} connected`
+    : `Room ${roomCode}`;
+}
+
+function startHost(){
+  if (peer) peer.destroy();
+  isHost = true;
+  const id = Math.random().toString(36).slice(2, 7);
+  peer = new Peer(PREFIX + id);
+  peer.on('open', () => {
+    roomCode = id; resetCanvas(); showBoard(); updateStatus();
+  });
+  peer.on('connection', c => {
+    c.on('open', () => {
+      guests.push(c); c.send({ t:'init', h: history }); updateStatus();
+    });
+    c.on('data', d => {
+      if (d.t === 's'){ drawSeg(d); history.push(d); broadcast(d, c); }
+      else if (d.t === 'undo'){ applyUndo(d.k); broadcast(d, c); }
+    });
+    const drop = () => { guests = guests.filter(g => g !== c); updateStatus(); };
+    c.on('close', drop); c.on('error', drop);
+  });
+  peer.on('error', err => {
+    if (err.type === 'unavailable-id') startHost();   // code taken: try another
+    else say('Could not start the board: ' + err.type);
+  });
+}
+
+function join(code){
+  code = code.trim().toLowerCase();
+  if (!code) return say('Enter a room code.');
+  say('Connecting…');
+  if (peer) peer.destroy();
+  isHost = false; roomCode = code;
+  peer = new Peer();
+  peer.on('open', () => {
+    hostConn = peer.connect(PREFIX + code, { reliable: true });
+    hostConn.on('open', () => { resetCanvas(); showBoard(); updateStatus(); });
+    hostConn.on('data', d => {
+      if (d.t === 'init'){ history = d.h; redraw(); }
+      else if (d.t === 's'){ drawSeg(d); history.push(d); }
+      else if (d.t === 'undo') applyUndo(d.k);
+      else if (d.t === 'clear'){ history = []; myStrokes = []; updateUndo(); resetCanvas(); }
+    });
+    hostConn.on('close', () => { $('status').textContent = 'Host left the room'; });
+  });
+  peer.on('error', err => {
+    if (err.type === 'peer-unavailable') say('No board found with that code.');
+    else say('Connection problem: ' + err.type);
+  });
+}
+
+/* ---------- UI ---------- */
+const sw = $('swatches');
+PALETTE.forEach(c => {
+  const b = document.createElement('button');
+  b.className = 'sw'; b.style.background = c; b.setAttribute('aria-label', 'Colour ' + c);
+  b.setAttribute('aria-pressed', c === color);
+  b.onclick = () => pick(c);
+  sw.appendChild(b);
+});
+function pick(c){
+  color = c; setErase(false); $('custom').value = c;
+  [...sw.children].forEach((b, i) => b.setAttribute('aria-pressed', PALETTE[i] === c));
+}
+function setErase(on){
+  erasing = on; $('eraser').classList.toggle('on', on); $('eraser').setAttribute('aria-pressed', on);
+}
+$('custom').oninput = e => pick(e.target.value);
+$('size').oninput = e => size = +e.target.value;
+$('eraser').onclick = () => setErase(!erasing);
+
+$('clear').onclick = () => {
+  if (!confirm('Clear the board for everyone?')) return;
+  history = []; myStrokes = []; updateUndo(); resetCanvas(); broadcast({ t:'clear' });
+};
+$('share').onclick = async () => {
+  const url = location.origin + location.pathname + '?join=' + roomCode;
+  try { await navigator.clipboard.writeText(url); $('share').textContent = 'Link copied'; }
+  catch { prompt('Copy this link:', url); }
+  setTimeout(() => $('share').textContent = 'Copy invite link', 1800);
+};
+$('undo').onclick = undo;
+document.addEventListener('keydown', e => {
+  if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === 'z'){ e.preventDefault(); undo(); }
+});
+$('save').onclick = () => {
+  cv.toBlob(blob => {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'chalkboard-' + (roomCode || 'board') + '.png';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  }, 'image/png');
+};
+$('hostBtn').onclick = () => { say('Starting…'); startHost(); };
+$('joinForm').onsubmit = e => { e.preventDefault(); join($('code').value); };
+
+const q = new URLSearchParams(location.search).get('join');
+if (q){ $('code').value = q; join(q); }
+resetCanvas();
+</script>
+</body>
+</html>
